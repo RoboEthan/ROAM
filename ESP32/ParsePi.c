@@ -16,14 +16,14 @@
 #include <math.h>
 
 // ========= Pi <-> ESP32 UART =========
-#define RX_PIN 17      // Pi TX -> ESP32 RX
-#define TX_PIN 18      // Pi RX <- ESP32 TX
+#define RX_PIN 43      // Pi TX -> ESP32 RX (Was using 17 for rx and 18 for tx if this doesnt work)
+#define TX_PIN 44      // Pi RX <- ESP32 TX
 #define BAUD   115200
 
 // ========= Motor/LED Pins =========
 #define LEFT_PWM_PIN    10
 #define LEFT_EN_PIN      9
-#define RIGHT_PWM_PIN   21
+#define RIGHT_PWM_PIN   19 ( was using 21 if this doesnt work)
 #define RIGHT_EN_PIN     8
 
 // If the LED/device is wired active-low (pin sinks current), set true to invert PWM
