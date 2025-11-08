@@ -168,11 +168,12 @@ void piMotorTask(void*){
 // Core 1: SIM7600 (unchanged behavior)
 float parseCoord(const String &coord, const String &dir){
   if(coord.length()<4) return 0.0;
-  float deg = coord.substring(0, coord.length()-7).toFloat();
-  float min = coord.substring(coord.length()-7).toFloat();
-  float val = deg + (min/60.0);
-  if (dir=="S" || dir=="W") val = -val;
-  return val;
+  float val = coord.substring(0, coord.length()-7).toFloat();
+  int   deg = (int)(val / 100.0f);           // 28 (lat) or 81 (lon)
+  float min = val - (deg * 100.0f);          // 35.665756 or 13.977191
+  float dd = deg + (min/60.0f);
+  if (dir=="S" || dir=="W") dd = -dd;
+  return dd;
 }
 bool getGPS(float &lat, float &lon){
   String resp = sendAT("AT+CGPSINFO", 5000);
