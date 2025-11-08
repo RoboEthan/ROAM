@@ -40,6 +40,8 @@ static size_t lineLen = 0;
 static int  currentLeftDuty  = 0;
 static int  currentRightDuty = 0;
 
+static TaskHandle_t modemTaskHandle = nullptr;
+
 // ---------- safe prints (tolerate null mutex) ----------
 void sp(const char* s){ if(gSerialMtx) xSemaphoreTake(gSerialMtx, portMAX_DELAY); Serial.print(s);  if(gSerialMtx) xSemaphoreGive(gSerialMtx); }
 void spln(const char* s){ if(gSerialMtx) xSemaphoreTake(gSerialMtx, portMAX_DELAY); Serial.println(s); if(gSerialMtx) xSemaphoreGive(gSerialMtx); }
@@ -188,10 +190,13 @@ bool getGPS(float &lat, float &lon){
   lat = parseCoord(t[0], t[1]); lon = parseCoord(t[2], t[3]);
   return (lat!=0 && lon!=0);
 }
-void modemTask(void*){
+
+void modemTask(void*) {
   modem.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
   vTaskDelay(pdMS_TO_TICKS(1500));
-  spln("[CORE1] modemTask start");
+  spln("[CORE1] modemTask start (one-time init)");
+
+  // Cellular + GPS once
   sendAT("AT"); sendAT("AT+CPIN?"); sendAT("AT+CSQ");
   sendAT("AT+CGATT=1", 10000);
   sendAT("AT+CGDCONT=1,\"IP\",\"" APN "\"");
@@ -199,42 +204,109 @@ void modemTask(void*){
   sendAT("AT+CGPS=0", 1500);
   sendAT("AT+CGPS=1", 5000);
 
-  for(;;){
-    float lat=0, lon=0;
-    spln("[CORE1] waiting GPS...");
-    for(int i=0;i<5 && !getGPS(lat,lon); i++){ sp("."); vTaskDelay(pdMS_TO_TICKS(1500)); }
-    sp("\n");
-    String body = "{\"lat\":"+String(lat,6)+",\"lon\":"+String(lon,6)+"}";
-    spln(("[CORE1] POST "+body).c_str());
-    sendAT("AT+HTTPTERM");
-    sendAT("AT+HTTPINIT");
-    sendAT("AT+HTTPPARA=\"CID\",1");
-    sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
-    sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
-    sendAT("AT+HTTPSSL=1");
-    int len = body.length();
-    sendAT("AT+HTTPDATA="+String(len)+",10000", 5000, "DOWNLOAD");
-    modem.print(body);
-    vTaskDelay(pdMS_TO_TICKS(300));
-    sendAT("AT+HTTPACTION=1", 15000, "+HTTPACTION");
-    sendAT("AT+HTTPREAD", 5000);
-    sendAT("AT+HTTPTERM");
-    vTaskDelay(pdMS_TO_TICKS(10000));
+  // HTTP once
+  sendAT("AT+HTTPTERM");
+  sendAT("AT+HTTPINIT");
+  sendAT("AT+HTTPPARA=\"CID\",1");
+  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+  sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
+  sendAT("AT+HTTPSSL=1");
+
+  const uint32_t MIN_POST_GAP_MS = 3000;
+  uint32_t lastPostMs = 0;
+
+  for (;;) {
+    // Wait for Treasure trigger from core 0
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    spln("[CORE1] trigger -> getting GPS...");
+
+    // Debounce
+    uint32_t now = millis();
+    if (now - lastPostMs < MIN_POST_GAP_MS) {
+      spln("[CORE1] trigger ignored (debounce)");
+      continue;
+    }
+
+    // Get fix (quick retries)
+    float lat = NAN, lon = NAN;
+    for (int i = 0; i < 8 && (isnan(lat) || isnan(lon)); ++i) {
+      if (getGPS(lat, lon)) break;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (isnan(lat) || isnan(lon)) { spln("[CORE1][WARN] No GPS fix; posting 0,0"); lat=0; lon=0; }
+    else { spf("[CORE1][GPS] lat=%.6f lon=%.6f\n", lat, lon); }
+
+    // POST
+    String body = "{\"lat\":" + String(lat, 6) + ",\"lon\":" + String(lon, 6) + "}";
+    spf("[CORE1] POST %s\n", body.c_str());
+
+    auto postOnce = [&]() {
+      int len = body.length();
+      String r = sendAT("AT+HTTPDATA=" + String(len) + ",10000", 5000, "DOWNLOAD");
+      if (r.indexOf("DOWNLOAD") == -1) return false;
+      modem.print(body);
+      vTaskDelay(pdMS_TO_TICKS(300));
+      r = sendAT("AT+HTTPACTION=1", 15000, "+HTTPACTION");
+      if (r.indexOf("+HTTPACTION:") == -1) return false;
+      sendAT("AT+HTTPREAD", 5000);
+      return true;
+    };
+
+    if (!postOnce()) {
+      spln("[CORE1][HTTP] error; reinit HTTP and retry");
+      sendAT("AT+HTTPTERM");
+      sendAT("AT+HTTPINIT");
+      sendAT("AT+HTTPPARA=\"CID\",1");
+      sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+      sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
+      sendAT("AT+HTTPSSL=1");
+      postOnce();
+    }
+
+    lastPostMs = millis();
   }
 }
 
+
 // ---------- JSON handlers ----------
 void handleJsonLine(const char* s){
+  // Trim
   while(*s==' '||*s=='\t') s++;
-  if(*s!='{' || strchr(s,'}')==nullptr){ spln("[WARN] Not JSON"); return; }
+  size_t n = strlen(s);
+  while(n && (s[n-1]==' '||s[n-1]=='\t')) n--;
+
+  // Require JSON braces
+  if (n==0 || s[0] != '{' || strchr(s, '}') == nullptr) {
+    spln("[WARN] Not JSON/bare category");
+    return;
+  }
+
+  // 1) Category handling first (so {"C":"T"} works even without L)
+  char cat;
+  if (parseCategory(s, cat)) {
+    if (cat == 'T') {
+      spln("[RX] CATEGORY: Treasure (T) -> notifying modem");
+      if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
+    } else if (cat == 'G') {
+      spln("[RX] CATEGORY: Garbage (G)");
+    } else {
+      spf("[RX] CATEGORY: Unknown (%c)\n", cat);
+    }
+  }
+
+  // 2) Optional L handling (steering); ok if absent
   long L;
-  if(!parseLValue(s,L)){ spln("[INFO] No \"L\" field"); return; }
-  spf("[RX] L=%ld\n", L);
-  int mag = normalizeMagnitude(L);
-  if (L>0)      leftSetDuty(mag);
-  else if (L<0) rightSetDuty(mag);
-  else          stopBoth();
+  if (parseLValue(s, L)) {
+    spf("[RX] L=%ld\n", L);
+    int mag = normalizeMagnitude(L);
+    if (L>0)      leftSetDuty(mag);
+    else if (L<0) rightSetDuty(mag);
+    else          stopBoth();
+  } else {
+    spln("[INFO] No \"L\" field");
+  }
 }
+
 bool parseLValue(const char* s, long &outVal){
   const char* k=strstr(s,"\"L\""); if(!k) return false;
   const char* c=strchr(k,':');     if(!c) return false;
@@ -257,7 +329,7 @@ void setup(){
   if(!gSerialMtx) Serial.println("[BOOT] WARN: mutex create failed; continuing without lock");
 
   xTaskCreatePinnedToCore(piMotorTask, "piMotorTask", 4096, NULL, 2, NULL, 0); // Core 0
-  xTaskCreatePinnedToCore(modemTask,   "modemTask",   8192, NULL, 2, NULL, 1); // Core 1
+  xTaskCreatePinnedToCore(modemTask, "modemTask", 8192, NULL, 2, &modemTaskHandle, 1); //code 1
   Serial.println("[BOOT] tasks created");
 }
 void loop(){}
