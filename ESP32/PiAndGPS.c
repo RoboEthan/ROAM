@@ -139,11 +139,11 @@ void piMotorTask(void*){
 
   TickType_t lastBeat = xTaskGetTickCount();
   for(;;){
-    // Heartbeat every 1s regardless of UART traffic
-    if(xTaskGetTickCount() - lastBeat >= pdMS_TO_TICKS(1000)){
-      spln("[CORE0] heartbeat");
-      lastBeat = xTaskGetTickCount();
-    }
+    // // Heartbeat every 1s regardless of UART traffic
+    // if(xTaskGetTickCount() - lastBeat >= pdMS_TO_TICKS(5000)){
+    //   spln("[CORE0] heartbeat");
+    //   lastBeat = xTaskGetTickCount();
+    // }
 
     // Read until newline and echo raw
     while (Serial1.available()){
@@ -168,15 +168,25 @@ void piMotorTask(void*){
 }
 
 // Core 1: SIM7600 (unchanged behavior)
-float parseCoord(const String &coord, const String &dir){
-  if(coord.length()<4) return 0.0;
-  float val = coord.substring(0, coord.length()-7).toFloat();
-  int   deg = (int)(val / 100.0f);           // 28 (lat) or 81 (lon)
-  float min = val - (deg * 100.0f);          // 35.665756 or 13.977191
-  float dd = deg + (min/60.0f);
-  if (dir=="S" || dir=="W") dd = -dd;
+// NMEA "ddmm.mmmm" (lat) or "dddmm.mmmm" (lon) -> decimal degrees
+float parseCoord(const String &coord, const String &dir) {
+  // guard
+  if (coord.length() < 4) return NAN;
+  // some modems send empty fields as "", or "0"
+  if (coord == "" || coord == "0" || coord == "0.0") return NAN;
+
+  // convert whole field to float (leading zeros OK: "08113.977191" -> 8113.977191)
+  float v = coord.toFloat();
+  if (!isfinite(v)) return NAN;
+
+  int   deg = (int)floorf(v / 100.0f);   // e.g., 28 or 81
+  float min = v - (deg * 100.0f);        // e.g., 35.665756 or 13.977191
+  float dd  = deg + (min / 60.0f);
+
+  if (dir == "S" || dir == "W") dd = -dd;
   return dd;
 }
+
 bool getGPS(float &lat, float &lon){
   String resp = sendAT("AT+CGPSINFO", 5000);
   int idx = resp.indexOf("+CGPSINFO:"); if(idx==-1) return false;
