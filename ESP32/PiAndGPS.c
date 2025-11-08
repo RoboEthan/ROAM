@@ -207,7 +207,10 @@ void modemTask(void*) {
   spln("[CORE1] modemTask start (one-time init)");
 
   // Cellular + GPS once
-  sendAT("AT"); sendAT("AT+CPIN?"); sendAT("AT+CSQ");
+  sendAT("AT"); 
+  sendAT("ATE0");            
+  sendAT("AT+CPIN?"); 
+  sendAT("AT+CSQ");
   sendAT("AT+CGATT=1", 10000);
   sendAT("AT+CGDCONT=1,\"IP\",\"" APN "\"");
   sendAT("AT+CGPADDR=1");
@@ -256,7 +259,7 @@ void modemTask(void*) {
       if (r.indexOf("DOWNLOAD") == -1) return false;
       modem.print(body);
       vTaskDelay(pdMS_TO_TICKS(300));
-      r = sendAT("AT+HTTPACTION=1", 15000, "+HTTPACTION");
+      r = sendAT("AT+HTTPACTION=1", 15000, "+HTTPACTION:");
       if (r.indexOf("+HTTPACTION:") == -1) return false;
       sendAT("AT+HTTPREAD", 5000);
       return true;
@@ -298,7 +301,8 @@ void handleJsonLine(const char* s){
       spln("[RX] CATEGORY: Treasure (T) -> notifying modem");
       if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
     } else if (cat == 'G') {
-      spln("[RX] CATEGORY: Garbage (G)");
+      spln("[RX] CATEGORY: Treasure (G) -> notifying modem");
+      if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
     } else {
       spf("[RX] CATEGORY: Unknown (%c)\n", cat);
     }
