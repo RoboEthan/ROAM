@@ -1,0 +1,32 @@
+[Unit]
+Description=ROAM Camera + Classification (sends META/JPEG to forwarder socket)
+After=uart-forwarder.service
+Requires=uart-forwarder.service
+
+[Service]
+Type=simple
+User=dkclaass
+WorkingDirectory=/home/dkclaass/Desktop/TVT
+Environment=PYTHONUNBUFFERED=1
+
+# If using a venv for ultralytics, point to that python instead:
+# ExecStart=/home/dkclaass/Desktop/TVT/.venv/bin/python /home/dkclaass/Desktop/TVT/CameraClassificationTogether.py
+ExecStart=/usr/bin/python3 /home/dkclaass/Desktop/TVT/CameraClassificationTogether.py
+
+# Ensure forwarder socket exists before starting
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -S /tmp/roam_uart.sock ] && exit 0; sleep 0.2; done; exit 0'
+
+Restart=always
+RestartSec=1
+
+# Lower priority than forwarder; keep on cores 0–2
+CPUAffinity=0 1 2
+CPUSchedulingPolicy=other
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,32 @@
+Unit]
+Description=ROAM LiDAR Producer (sends frames to /tmp/roam_uart.sock)
+After=uart-forwarder.service
+Requires=uart-forwarder.service
+
+[Service]
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Environment=PYTHONUNBUFFERED=1
+Type=simple
+User=dkclaass
+WorkingDirectory=/home/dkclaass/Desktop/TVT
+Environment=PYTHONUNBUFFERED=1
+# If ydlidar isn't installed system-wide, uncomment and adjust:
+# Environment=PYTHONPATH=/usr/local/lib/python3.11/dist-packages:/home/dkclaass/YDLidar-SDK/build/python
+
+# Ensure forwarder socket exists before starting
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -S /tmp/roam_uart.sock ] && exit 0; sleep 0.2; done; exit 0'
+ExecStart=/usr/bin/python3 /home/dkclaass/Desktop/TVT/LiDARv1.py
+
+Restart=always
+RestartSec=0.5
+
+# Medium priority on cores 0-2
+CPUAffinity=0 1 2
+CPUSchedulingPolicy=other
+Nice=0
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+
+[Install]
+WantedBy=multi-user.target
