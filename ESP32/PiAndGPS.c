@@ -8,24 +8,37 @@
 
 SemaphoreHandle_t gSerialMtx = nullptr;
 
-// ===== UARTs (safe pins on S3) =====
-#define PI_RX_PIN   44      // Pi TX -> ESP32 RX (Serial1)
-#define PI_TX_PIN   43      // Pi RX <- ESP32 TX
+// ===== UARTs (keep as-is) =====
+#define PI_RX_PIN   44
+#define PI_TX_PIN   43
 #define PI_BAUD     115200
 
-#define MODEM_TX    17      // ESP32 -> SIM7600 RX (Serial2)
-#define MODEM_RX    18      // ESP32 <- SIM7600 TX
+#define MODEM_TX    17
+#define MODEM_RX    18
 #define MODEM_BAUD  115200
 #define APN "wholesale"
 #define URL "https://roambot.dev/data"
 
 HardwareSerial modem(2);
 
-// ===== Motor pins (RIGHT PWM moved off USB pins) =====
-#define LEFT_PWM_PIN      10
-#define RIGHT_PWM_PIN     21 //do not assign to 19, it will break usb connection I think
-#define LEFT_EN_PIN        9
-#define RIGHT_EN_PIN       8
+// ===== Motor pins (unipolar: DIR steady, PWM pulsed) =====
+#define L_DIR 19   // was LEFT_EN_PIN
+#define L_PWM 8    // was LEFT_PWM_PIN
+#define R_DIR 10   // was RIGHT_EN_PIN
+#define R_PWM 9    // was RIGHT_PWM_PIN
+// #define LED_PIN 21 // heartbeat (same as before if you use it)
+
+// Levels/polarity (keep these unless your hardware is opposite)
+#define LEFT_FORWARD_LEVEL   HIGH
+#define RIGHT_FORWARD_LEVEL  HIGH
+#define LEFT_PWM_ACTIVE_HIGH   0   // 0 = active-LOW, 1 = active-HIGH
+#define RIGHT_PWM_ACTIVE_HIGH  0   // 0 = active-LOW, 1 = active-HIGH
+
+#define LEFT_PWM_PIN   L_PWM
+#define RIGHT_PWM_PIN  R_PWM
+#define LEFT_EN_PIN    L_DIR
+#define RIGHT_EN_PIN   R_DIR
+
 
 const bool LEFT_ACTIVE_LOW  = false;
 const bool RIGHT_ACTIVE_LOW = false;
@@ -130,8 +143,8 @@ void piMotorTask(void*){
 #if defined(ARDUINO_ARCH_ESP32)
   analogWriteResolution(LEFT_PWM_PIN,  8);
   analogWriteResolution(RIGHT_PWM_PIN, 8);
-  analogWriteFrequency(LEFT_PWM_PIN,   20000);
-  analogWriteFrequency(RIGHT_PWM_PIN,  20000);
+  analogWriteFrequency(LEFT_PWM_PIN,   5000); //test out numbers in the third parameter
+  analogWriteFrequency(RIGHT_PWM_PIN,  5000);
 #endif
 
   stopBoth();
