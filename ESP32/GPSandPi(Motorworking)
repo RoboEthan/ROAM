@@ -1,0 +1,503 @@
+// =============================================================
+// ESP32-S3 — Dual-core diagnostics (USB Serial + Pi UART + SIM7600)
+// Core 0: Pi UART + motors (PWM) + line-by-line JSON processing
+// Core 1: SIM7600 modem (GPS + HTTP POST) triggered by categories
+//
+// Key steering behavior (your rule set):
+//   - Deadband: L ∈ [-10, +10] --> LEFT = 20%, RIGHT = 20%
+//   - L > 10  (turn RIGHT):
+//       RIGHT = (20% of 255 ≈ 51) + |L|   (clamped at 255)
+//       LEFT  = max(0, 51 - |L|)          // never reverse
+//   - L < -10 (turn LEFT):
+//       LEFT  = (20% of 255 ≈ 51) + |L|   (clamped at 255)
+//       RIGHT = max(0, 51 - |L|)          // never reverse
+//   - Examples:
+//       L= 127 -> RIGHT ≈ 178 (~70%), LEFT = 0
+//       L=-127 -> LEFT  ≈ 178 (~70%), RIGHT= 0
+//       L= 255 -> RIGHT = 255 (100%), LEFT = 0
+//       L=-255 -> LEFT  = 255 (100%), RIGHT= 0
+//
+// Notes:
+//   * PWM is 8-bit (0..255) at 5 kHz. 0=off, 255=fully on (unless active-low).
+//   * PWM is now LINEAR (no gamma shaping).
+//   * Active-low flags invert the PWM polarity if your driver expects LOW=ON.
+//   * Direction pins here act as "enable" lines: held HIGH when that motor is on.
+//
+// JSON expected (newline-terminated):
+//   {"L": <signed int>}          // steering command
+//   {"C":"T"} or {"C":"G"}       // triggers GPS/HTTP POST
+// =============================================================
+
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include <math.h>
+
+// -------------- Multi-core print synchronization --------------
+// We use a mutex so both tasks can safely print over USB Serial.
+SemaphoreHandle_t gSerialMtx = nullptr;
+
+// ======================= UART pinout ==========================
+// Pi UART on Serial1 (RX/TX to the ESP32):
+#define PI_RX_PIN   44                  // Pi TX -> ESP32 RX
+#define PI_TX_PIN   43                  // Pi RX <- ESP32 TX
+#define PI_BAUD     115200              // JSON stream @ 115200 baud
+
+// SIM7600 modem on Serial2 (HardwareSerial(2)):
+#define MODEM_TX    17                  // ESP32 -> SIM7600 RX
+#define MODEM_RX    18                  // ESP32 <- SIM7600 TX
+#define MODEM_BAUD  115200
+#define APN "wholesale"                 // Mint Mobile APN
+#define URL "https://roambot.dev/data"  // Your server endpoint
+
+HardwareSerial modem(2);                // UART2 handle for modem
+
+// ==================== Motor pin configuration =================
+// We are using "unipolar" drive style:
+//   * DIR pins are used as enable (steady HIGH = enabled)
+//   * PWM pins output the 5 kHz duty waveform
+#define L_DIR 19     // Left "enable" (HIGH = on)
+#define L_PWM 8      // Left PWM pin
+#define R_DIR 10     // Right "enable" (HIGH = on)
+#define R_PWM 9      // Right PWM pin
+
+// Direction levels (kept for clarity; not flipping here)
+#define LEFT_FORWARD_LEVEL   HIGH
+#define RIGHT_FORWARD_LEVEL  HIGH
+
+// Aliases to emphasize which pins are PWM vs "enable"
+#define LEFT_PWM_PIN   L_PWM
+#define RIGHT_PWM_PIN  R_PWM
+#define LEFT_EN_PIN    L_DIR
+#define RIGHT_EN_PIN   R_DIR
+
+// -------- Active-low PWM polarity control ---------
+// Some motor drivers (or LEDs) are "active-low": LOW=ON, HIGH=OFF.
+// If that's your case, set these to true to invert the PWM duty.
+const bool LEFT_ACTIVE_LOW  = false;
+const bool RIGHT_ACTIVE_LOW = false;
+
+// ================== PWM configuration (linear) =================
+const int MAX_DUTY = 255;   // max linear duty
+
+// --------- Line buffer for building a JSON line from UART ---------
+static char   lineBuf[256];
+static size_t lineLen = 0;
+
+// --------- Debug mirror of current left/right linear duties -------
+static int  currentLeftDuty  = 0;    // last linear duty (0..255) we commanded
+static int  currentRightDuty = 0;
+
+// --------- Handle for notifying the modem (Core 1) ----------------
+static TaskHandle_t modemTaskHandle = nullptr;
+
+// ================== Thread-safe print helpers ====================
+void sp(const char* s){
+  if(gSerialMtx) xSemaphoreTake(gSerialMtx, portMAX_DELAY);
+  Serial.print(s);
+  if(gSerialMtx) xSemaphoreGive(gSerialMtx);
+}
+void spln(const char* s){
+  if(gSerialMtx) xSemaphoreTake(gSerialMtx, portMAX_DELAY);
+  Serial.println(s);
+  if(gSerialMtx) xSemaphoreGive(gSerialMtx);
+}
+void spf(const char* fmt, ...){
+  if(gSerialMtx) xSemaphoreTake(gSerialMtx, portMAX_DELAY);
+  va_list ap; va_start(ap, fmt); Serial.vprintf(fmt, ap); va_end(ap);
+  if(gSerialMtx) xSemaphoreGive(gSerialMtx);
+}
+
+// ========================= PWM helpers ===========================
+// Write a (linear) duty to a PWM pin, honoring active-low polarity.
+// NO GAMMA: linear 0..255 goes straight to analogWrite (with optional inversion).
+static inline void pwmWritePin(int pin, int duty_linear_0_255, bool activeLow){
+  duty_linear_0_255 = constrain(duty_linear_0_255, 0, 255);
+  uint8_t duty = (uint8_t)duty_linear_0_255;       // LINEAR mapping
+  if(activeLow) duty = 255 - duty;                 // invert if LOW=ON
+  analogWrite(pin, duty);                          // push to hardware PWM
+}
+
+// "Enable" lines (steady): HIGH when motor should be able to move.
+// We keep them HIGH when commanded duty > 0; LOW otherwise.
+static inline void leftEnable (bool on){  digitalWrite(LEFT_EN_PIN,  on?HIGH:LOW); }
+static inline void rightEnable(bool on){  digitalWrite(RIGHT_EN_PIN, on?HIGH:LOW); }
+
+// Set left/right linear duties (0..255), update enables, and log.
+void leftSetDuty (int d){
+  d = constrain(d, 0, MAX_DUTY);
+  pwmWritePin(LEFT_PWM_PIN, d, LEFT_ACTIVE_LOW);
+  leftEnable(d > 0);
+  currentLeftDuty = d;
+  spf("[LEFT] duty=%d (RIGHT=%d)\n", currentLeftDuty, currentRightDuty);
+}
+void rightSetDuty(int d){
+  d = constrain(d, 0, MAX_DUTY);
+  pwmWritePin(RIGHT_PWM_PIN, d, RIGHT_ACTIVE_LOW);
+  rightEnable(d > 0);
+  currentRightDuty = d;
+  spf("[RIGHT] duty=%d (LEFT=%d)\n", currentRightDuty, currentLeftDuty);
+}
+
+// Immediately stop both motors (PWM=0; enables LOW).
+void stopBoth(){
+  leftSetDuty(0);
+  rightSetDuty(0);
+  leftEnable(false);
+  rightEnable(false);
+  spln("[MOTOR] Stop BOTH");
+}
+
+// ===================== Steering mapper ==========================
+// Implements your "20% base ± |L| contribution" logic in PWM units.
+// Inputs:
+//   Lraw: signed steering value from JSON (expected range [-255, +255])
+// Behavior summary:
+//   * If L within deadband [-10..+10]: both = 20% (≈51)
+//   * If L > 10 : turn RIGHT (raise RIGHT, reduce LEFT to floor 0)
+//   * If L < -10: turn LEFT  (raise LEFT,  reduce RIGHT to floor 0)
+// No reversing: we never command negative power to either side.
+static inline void applySteering(long Lraw){
+  const int   DEADBAND = 10;                       // deadband around zero
+  const int   MAXPWM   = 255;                      // 100% power
+  const int   BASEPWM  = (int)roundf(0.20f * MAXPWM); // 20% baseline (~51)
+
+  // Magnitude of the command contributes in PWM units directly (0..255)
+  int L = (int)constrain(Lraw, -255L, 255L);
+  int delta = abs(L); 
+
+  if (L > 10){
+    // TURN RIGHT:
+    // - Right grows: base + delta (capped at 255)
+    // - Left  shrinks: base - delta (floored at 0)
+    int right = BASEPWM + delta; if (right > MAXPWM) right = MAXPWM;
+    int left  = BASEPWM - delta; if (left  < 0)      left  = 0;
+
+    leftSetDuty(left);
+    rightSetDuty(right);
+
+  } else if (L < -10) {
+    // TURN LEFT:
+    // - Left grows: base + delta (capped at 255)
+    // - Right shrinks: base - delta (floored at 0)
+    int left  = BASEPWM + delta; if (left  > MAXPWM) left  = MAXPWM;
+    int right = BASEPWM - delta; if (right < 0)      right = 0;
+
+    leftSetDuty(left);
+    rightSetDuty(right);
+
+  } else {
+    // Deadband -> both at 20%
+    leftSetDuty(BASEPWM);
+    rightSetDuty(BASEPWM);
+  }
+}
+
+// ======================= JSON parsing ===========================
+// Minimal JSON readers for speed/robustness (no heap allocs).
+// Expected patterns:
+//   - L field:   {"L":123}
+//   - Category:  {"C":"T"} or {"C":"G"}
+void handleJsonLine(const char* s);
+bool parseCategory(const char* s, char &outCat);
+bool parseLValue(const char* s, long &outVal);
+
+// ======================= Modem utilities ========================
+// Send an AT command, collect characters until timeout.
+// If 'waitFor' is provided, exit early when that substring appears
+// (useful for commands like HTTPACTION). Also prints command/response.
+String sendAT(const String &cmd, uint32_t timeout=10000, const char *waitFor=nullptr){
+  modem.println(cmd);
+  sp(">> "); spln(cmd.c_str());       // echo the command to USB log
+  String resp;
+  uint32_t start=millis();
+  while(millis()-start < timeout){
+    while(modem.available()) resp += (char)modem.read();
+    if(waitFor && resp.indexOf(waitFor)!=-1) break;
+    if(resp.indexOf("+HTTPACTION:")!=-1) break;  // stop once we see HTTP action status
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  if(resp.length()) spln(resp.c_str());          // dump raw modem response
+  return resp;
+}
+
+// ========================== TASKS ===============================
+// ---------------------- Core 0: Pi + Motors ---------------------
+// Reads Serial1 (Pi) bytes, builds lines until '\n', then:
+//   * handleJsonLine(line)
+//   * Steering is updated immediately (applySteering)
+//   * Category "T"/"G" notifies modem task to post GPS coords
+void piMotorTask(void*){
+  // Bring-up banner to confirm the task starts correctly
+  for(int i=0;i<3;i++){
+    spln("[CORE0] booting piMotorTask...");
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+
+  // Initialize Pi UART
+  Serial1.begin(PI_BAUD, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
+  while (Serial1.available()) Serial1.read(); // flush any junk
+
+  // Configure motor pins
+  pinMode(LEFT_EN_PIN,  OUTPUT);
+  pinMode(RIGHT_EN_PIN, OUTPUT);
+
+#if defined(ARDUINO_ARCH_ESP32)
+  // Configure PWM resolution/frequency once for both channels
+  analogWriteResolution(LEFT_PWM_PIN,  8);  // (left as-is, per your request)
+  analogWriteResolution(RIGHT_PWM_PIN, 8);
+  analogWriteFrequency(LEFT_PWM_PIN,   8000); // 5 kHz PWM (good for motors)
+  analogWriteFrequency(RIGHT_PWM_PIN,  8000);
+#endif
+
+  // Start in a known safe state
+  stopBoth();
+  spln("[CORE0] READY: JSON at 115200 on RX=44/TX=43");
+
+  // Main loop: assemble a line and process when '\n' arrives
+  for(;;){
+    while (Serial1.available()){
+      char c = (char)Serial1.read();
+
+      // Debug: show each byte (hex + printable)
+      spf("[CORE0] RX byte: 0x%02X '%c'\n", (uint8_t)c, (c>=32&&c<127)?c:'.');
+
+      if (c=='\r') continue;                        // ignore CR
+      if (c=='\n'){                                 // end-of-line
+        lineBuf[min(lineLen, sizeof(lineBuf)-1)] = '\0';
+        if(lineLen>0){
+          sp("[PI->ESP32] "); spln(lineBuf);        // echo the line
+          handleJsonLine(lineBuf);                  // parse+act
+        }
+        lineLen = 0;                                // reset buffer
+      }else{
+        if (lineLen < sizeof(lineBuf)-1) lineBuf[lineLen++] = c;
+        else lineLen = 0;                           // overflow guard (reset)
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));                   // small yield to RTOS
+  }
+}
+
+// ---------------------- Core 1: SIM7600 -------------------------
+// - One-time init: attach to network, start GPS, prepare HTTP params.
+// - Waits for a task notification (from Core0 category).
+// - On notify: tries to read GPS (few quick retries) and POST JSON {lat,lon}.
+float parseCoord(const String &coord, const String &dir) {
+  // Modem gives "ddmm.mmmm" (lat) or "dddmm.mmmm" (lon).
+  // We convert: deg = floor(v/100), min = v - deg*100, dd = deg + min/60.
+  if (coord.length() < 4) return NAN;
+  if (coord == "" || coord == "0" || coord == "0.0") return NAN;
+
+  float v = coord.toFloat();
+  if (!isfinite(v)) return NAN;
+
+  int   deg = (int)floorf(v / 100.0f);
+  float min = v - (deg * 100.0f);
+  float dd  = deg + (min / 60.0f);
+
+  if (dir == "S" || dir == "W") dd = -dd;
+  return dd;
+}
+
+// Query one CGPSINFO and parse out decimal lat/lon.
+// Returns true if both parsed and non-zero.
+bool getGPS(float &lat, float &lon){
+  String resp = sendAT("AT+CGPSINFO", 5000);
+  int idx = resp.indexOf("+CGPSINFO:"); if(idx==-1) return false;
+
+  String data = resp.substring(idx+10); data.trim();
+  if (data.startsWith(",")) return false;  // empty fix fields
+
+  // CGPSINFO fields are comma-separated; we just need first 4
+  String t[8]; int last=0,c=0;
+  for(int i=0;i<data.length() && c<8;i++){
+    if(data[i]==','||data[i]=='\n'||data[i]=='\r'){ t[c++]=data.substring(last,i); last=i+1; }
+  }
+  if(c<4) return false;
+
+  lat = parseCoord(t[0], t[1]);
+  lon = parseCoord(t[2], t[3]);
+  return (lat!=0 && lon!=0);
+}
+
+void modemTask(void*) {
+  // Start the modem UART
+  modem.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  spln("[CORE1] modemTask start (one-time init)");
+
+  // --- Cellular bring-up ---
+  sendAT("AT");                         // attention
+  sendAT("ATE0");                       // echo off
+  sendAT("AT+CPIN?");                   // SIM ready?
+  sendAT("AT+CSQ");                     // signal quality
+  sendAT("AT+CGATT=1", 10000);          // attach to packet service
+  sendAT("AT+CGDCONT=1,\"IP\",\"" APN "\""); // APN
+  sendAT("AT+CGPADDR=1");               // IP check
+
+  // --- GPS restart ---
+  sendAT("AT+CGPS=0", 1500);            // cold stop
+  sendAT("AT+CGPS=1", 5000);            // start GPS
+
+  // --- HTTP setup (one-time) ---
+  sendAT("AT+HTTPTERM");                // clean any previous sessions
+  sendAT("AT+HTTPINIT");                // init HTTP stack
+  sendAT("AT+HTTPPARA=\"CID\",1");      // PDP context 1
+  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+  sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
+  sendAT("AT+HTTPSSL=1");               // use HTTPS
+
+  const uint32_t MIN_POST_GAP_MS = 3000; // debounce multiple triggers
+  uint32_t lastPostMs = 0;
+
+  for (;;) {
+    // Wait here until Core0 notifies us (on {"C":"T"} or {"C":"G"})
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    spln("[CORE1] trigger -> getting GPS...");
+
+    // Debounce to avoid spamming while object detection chatters
+    uint32_t now = millis();
+    if (now - lastPostMs < MIN_POST_GAP_MS) {
+      spln("[CORE1] trigger ignored (debounce)");
+      continue;
+    }
+
+    // Try to get a fix (up to ~8 seconds total)
+    float lat = NAN, lon = NAN;
+    for (int i = 0; i < 8 && (isnan(lat) || isnan(lon)); ++i) {
+      if (getGPS(lat, lon)) break;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (isnan(lat) || isnan(lon)) {
+      spln("[CORE1][WARN] No GPS fix; posting 0,0");
+      lat=0; lon=0;
+    } else {
+      spf("[CORE1][GPS] lat=%.6f lon=%.6f\n", lat, lon);
+    }
+
+    // Assemble JSON body and POST it
+    String body = "{\"lat\":" + String(lat, 6) + ",\"lon\":" + String(lon, 6) + "}";
+    spf("[CORE1] POST %s\n", body.c_str());
+
+    // Small lambda to send one HTTP POST transaction
+    auto postOnce = [&]() {
+      int len = body.length();
+      // Tell modem we're about to write <len> bytes; wait for DOWNLOAD prompt
+      String r = sendAT("AT+HTTPDATA=" + String(len) + ",10000", 5000, "DOWNLOAD");
+      if (r.indexOf("DOWNLOAD") == -1) return false;
+
+      // Write body payload
+      modem.print(body);
+      vTaskDelay(pdMS_TO_TICKS(300));   // tiny settle delay
+
+      // Kick POST; wait for +HTTPACTION:
+      r = sendAT("AT+HTTPACTION=1", 15000, "+HTTPACTION:");
+      if (r.indexOf("+HTTPACTION:") == -1) return false;
+
+      // Read response (optional)
+      sendAT("AT+HTTPREAD", 5000);
+      return true;
+    };
+
+    // Try once; if it fails, reinitialize HTTP and retry once
+    if (!postOnce()) {
+      spln("[CORE1][HTTP] error; reinit HTTP and retry");
+      sendAT("AT+HTTPTERM");
+      sendAT("AT+HTTPINIT");
+      sendAT("AT+HTTPPARA=\"CID\",1");
+      sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+      sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
+      sendAT("AT+HTTPSSL=1");
+      postOnce();
+    }
+
+    lastPostMs = millis();
+  }
+}
+
+// ===================== JSON handlers ============================
+// handleJsonLine: trims, sanity-checks for braces, then:
+//   1) Category: {"C":"T"} or {"C":"G"} -> notify modem task
+//   2) Steering: {"L":<signed int>}     -> applySteering(L)
+void handleJsonLine(const char* s){
+  // Trim leading/trailing spaces/tabs (non-destructive)
+  while(*s==' '||*s=='\t') s++;
+  size_t n = strlen(s);
+  while(n && (s[n-1]==' '||s[n-1]=='\t')) n--;
+
+  // Must look like JSON: start with '{' and contain a '}'
+  if (n==0 || s[0] != '{' || strchr(s, '}') == nullptr) {
+    spln("[WARN] Not JSON/bare category");
+    return;
+  }
+
+  // First, deal with category trigger (so it works even without "L")
+  char cat;
+  if (parseCategory(s, cat)) {
+    if (cat == 'T') {
+      spln("[RX] CATEGORY: Treasure (T) -> notifying modem");
+      if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
+    } else if (cat == 'G') {
+      spln("[RX] CATEGORY: Garbage (G) -> notifying modem");
+      if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
+    } else {
+      spf("[RX] CATEGORY: Unknown (%c)\n", cat);
+    }
+  }
+
+  // Then optional steering "L"
+  long L;
+  if (parseLValue(s, L)) {
+    spf("[RX] L=%ld\n", L);
+    applySteering(L);
+  } else {
+    spln("[INFO] No \"L\" field");
+  }
+}
+
+// parseLValue: finds a numeric value after the "L" key.
+// Accepts optional sign; stops on first non-digit.
+bool parseLValue(const char* s, long &outVal){
+  const char* k=strstr(s,"\"L\""); if(!k) return false;
+  const char* c=strchr(k,':');     if(!c) return false;
+  const char* p=c+1; while(*p==' '||*p=='\t') p++;
+  bool neg=false; if(*p=='-'){neg=true;p++;} else if(*p=='+'){p++;}
+  if(*p<'0'||*p>'9') return false;
+  long v=0; while(*p>='0'&&*p<='9'){ v=v*10+(*p-'0'); p++; }
+  outVal = neg? -v : v; return true;
+}
+
+// parseCategory: finds the first character inside quotes after "C":
+// e.g., {"C":"T"} -> outCat='T'
+bool parseCategory(const char* s, char &outCat){
+  const char* k=strstr(s,"\"C\""); if(!k) return false;
+  const char* c=strchr(k,':');     if(!c) return false;
+  const char* p=c+1; while(*p==' '||*p=='\t') p++;
+  if(*p!='\"') return false; p++;
+  if(!*p) return false; outCat=*p; return true;
+}
+
+// ===================== Arduino entry points =====================
+void setup(){
+  // USB serial for debugging; give host time to reopen port after reset
+  Serial.begin(115200);
+  uint32_t t0=millis();
+  while((millis()-t0)<1500 && !Serial){ delay(50); }
+  Serial.println("\n[BOOT] setup() starting");
+
+  // Create a mutex for thread-safe Serial prints (optional but nice to have)
+  gSerialMtx = xSemaphoreCreateMutex();
+  if(!gSerialMtx) Serial.println("[BOOT] WARN: mutex create failed; continuing without lock");
+
+  // Launch tasks pinned to specific cores:
+  //   * Core 0: Pi UART + motor control (time-sensitive PWM decisions)
+  //   * Core 1: Modem (AT commands, GPS, HTTP)
+  xTaskCreatePinnedToCore(piMotorTask, "piMotorTask", 4096, NULL, 2, NULL, 0); // Core 0
+  xTaskCreatePinnedToCore(modemTask,   "modemTask",   8192, NULL, 2, &modemTaskHandle, 1); // Core 1
+  Serial.println("[BOOT] tasks created");
+}
+
+void loop(){
+  // All work is in the two tasks.
+  // Keeping loop() empty avoids accidental blocking on Core 1's idle.
+}
