@@ -22,11 +22,15 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Simple display mode tracking
-enum DisplayMode { DISP_NONE, DISP_TRASH, DISP_TREASURE, DISP_HELP };
+enum DisplayMode { DISP_NONE, DISP_WAIT, DISP_TRASH, DISP_TREASURE, DISP_HELP };
 static DisplayMode gDisplayMode = DISP_NONE;
 static char        gLastCategory = 0;   // 'G' or 'T' if seen
 
+// System ready flag: false from boot until modem finishes HTTP/SSL init
+static bool gSystemReady = false;
+
 // Forward declarations for display helpers
+void displayWaiting();
 void displayTrash();
 void displayTreasure();
 void displayHelp();
@@ -119,7 +123,13 @@ static inline void updateStopLed(){
   bool bothZero = (currentLeftDuty == 0 && currentRightDuty == 0);
   digitalWrite(LED_STOP_PIN, bothZero ? HIGH : LOW);
 
-  // === LCD behavior ===
+  // While system is NOT ready, don't touch the OLED.
+  // We want to keep "WAITING" on screen until modem init is done.
+  if (!gSystemReady) {
+    return;
+  }
+
+  // === LCD behavior once system is ready ===
   if (bothZero) {
     // Both motors stopped -> show HELP regardless of category
     displayHelp();
@@ -204,8 +214,8 @@ void piMotorTask(void*){
   pinMode(LED_G_PIN, OUTPUT);
   pinMode(LED_T_PIN, OUTPUT);
   pinMode(LED_STOP_PIN, OUTPUT);
-  digitalWrite(LED_G_PIN, LOW);
-  digitalWrite(LED_T_PIN, LOW);
+  digitalWrite(LED_G_PIN, HIGH);
+  digitalWrite(LED_T_PIN, HIGH);
   digitalWrite(LED_STOP_PIN, LOW);
 
 #if defined(ARDUINO_ARCH_ESP32)
@@ -215,7 +225,7 @@ void piMotorTask(void*){
   analogWriteFrequency(RIGHT_PWM_PIN,  5000);
 #endif
 
-  stopBoth();  // this will also turn ON LED_STOP_PIN via updateStopLed()
+  stopBoth();  // this will also call updateStopLed(), but display won't change while !gSystemReady
   spln("[CORE0] READY: JSON at 115200 on RX=44/TX=43");
 
   for(;;){
@@ -239,7 +249,7 @@ void piMotorTask(void*){
   }
 }
 
-// Core 1: SIM7600 (unchanged)
+// Core 1: SIM7600 (unchanged except for gSystemReady flip)
 float parseCoord(const String &coord, const String &dir) {
   if (coord.length() < 4) return NAN;
   if (coord == "" || coord == "0" || coord == "0.0") return NAN;
@@ -290,6 +300,14 @@ void modemTask(void*) {
   sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
   sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
   sendAT("AT+HTTPSSL=1");
+
+  // When HTTP + SSL are ready, you turn both LEDs off:
+  digitalWrite(LED_G_PIN, LOW);
+  digitalWrite(LED_T_PIN, LOW);
+
+  // === Mark system as ready: from this point, STOP/HELP/Trash/Treasure logic
+  // is allowed to change the display ===
+  gSystemReady = true;
 
   const uint32_t MIN_POST_GAP_MS = 3000;
   uint32_t lastPostMs = 0;
@@ -361,14 +379,15 @@ void handleJsonLine(const char* s){
       digitalWrite(LED_T_PIN, HIGH);
       digitalWrite(LED_G_PIN, LOW);
       gLastCategory = 'T';
-      displayTreasure();     // === LCD: show "Treasure"
+      // Only change display if system is ready; otherwise keep WAITING
+      if (gSystemReady) displayTreasure();
       if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
     } else if (cat == 'G') {
       spln("[RX] CATEGORY: Garbage (G) -> notifying modem");
       digitalWrite(LED_G_PIN, HIGH);
       digitalWrite(LED_T_PIN, LOW);
       gLastCategory = 'G';
-      displayTrash();        // === LCD: show "Trash"
+      if (gSystemReady) displayTrash();
       if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
     } else {
       spf("[RX] CATEGORY: Unknown (%c)\n", cat);
@@ -412,15 +431,27 @@ bool parseCategory(const char* s, char &outCat){
 
 // ===================== OLED HELPER FUNCTIONS =====================
 
+void displayWaiting() {
+  if (gDisplayMode == DISP_WAIT) return;
+  gDisplayMode = DISP_WAIT;
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("R.O.A.M."));
+  display.setCursor(0, 30);
+  display.println(F("WAITING"));
+  display.display();
+}
+
 void displayTrash() {
-  // Only update if changing, to avoid flicker
   if (gDisplayMode == DISP_TRASH) return;
   gDisplayMode = DISP_TRASH;
 
   display.clearDisplay();
   display.setTextSize(3);
   display.setTextColor(SSD1306_WHITE);
-  // Roughly centered
   display.setCursor(10, 20);
   display.println(F("Trash"));
   display.display();
@@ -445,13 +476,11 @@ void displayHelp() {
   display.clearDisplay();
   display.setTextSize(3);
   display.setTextColor(SSD1306_WHITE);
-  // Center-ish "HELP"
   display.setCursor(20, 20);
   display.println(F("HELP"));
   display.display();
 }
 
-// Optionally used if you want to re-sync from state, but not strictly needed now.
 void refreshDisplayForState() {
   bool bothZero = (currentLeftDuty == 0 && currentRightDuty == 0);
   if (bothZero) {
@@ -473,14 +502,8 @@ void setup(){
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("[BOOT][OLED] SSD1306 allocation failed"));
   } else {
-    display.clearDisplay();
-    display.setTextSize(2);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println(F("R.O.A.M."));
-    display.setCursor(0, 30);
-    display.println(F("BOOTING..."));
-    display.display();
+    // Show WAITING from startup
+    displayWaiting();
   }
 
   gSerialMtx = xSemaphoreCreateMutex();
