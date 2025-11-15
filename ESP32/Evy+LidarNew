@@ -61,8 +61,8 @@ HardwareSerial modem(2);
 #define R_PWM 9    // was RIGHT_PWM_PIN
 
 // ===== LED pins =====
-#define LED_G_PIN      13   // ON when C == 'G'
-#define LED_T_PIN      14   // ON when C == 'T'
+#define LED_G_PIN      14   // ON when C == 'G'
+#define LED_T_PIN      13   // ON when C == 'T'
 #define LED_STOP_PIN   21   // ON when BOTH motors are 0
 
 // Levels/polarity
