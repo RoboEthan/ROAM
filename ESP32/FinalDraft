@@ -1,0 +1,597 @@
+// ESP32-S3 — Dual-core diagnostics (USB Serial + Pi UART + SIM7600)
+// Core 0: Pi UART + motors + HEARTBEAT prints every 1s
+// Core 1: SIM7600 (GPS->HTTP)
+
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include <math.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==================== OLED CONFIG ====================
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define SCREEN_ADDRESS 0x3C
+
+// I2C pins for SSD1306 (Claire: SDA=7, SCL=6)
+#define I2C_SDA 7
+#define I2C_SCL 6
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Simple display mode tracking
+enum DisplayMode { DISP_NONE, DISP_WAIT, DISP_READY, DISP_TRASH, DISP_TREASURE, DISP_HELP };
+static DisplayMode gDisplayMode = DISP_NONE;
+static char        gLastCategory = 0;   // 'G' or 'T' if seen
+
+// System ready flag: false from boot until modem finishes HTTP/SSL init
+static bool gSystemReady = false;
+
+// Buzzer timeout (0 = idle)
+static uint32_t gBuzzerOffMs = 0;
+
+// Forward declarations for display helpers
+void displayWaiting();
+void displayReady();
+void displayTrash();
+void displayTreasure();
+void displayHelp();
+void refreshDisplayForState();
+
+// Forward declaration for buzzer
+void buzzerStart1s();
+
+// ==================== REST OF ORIGINAL CODE ====================
+
+// ===== UARTs (keep as-is) =====
+#define PI_RX_PIN   44
+#define PI_TX_PIN   43
+#define PI_BAUD     115200
+
+#define MODEM_TX    17
+#define MODEM_RX    18
+#define MODEM_BAUD  115200
+#define APN "wholesale"
+#define URL "https://roambot.dev/data"
+
+HardwareSerial modem(2);
+
+// ===== Motor pins (unipolar: DIR steady, PWM pulsed) =====
+#define L_DIR 19   // was LEFT_EN_PIN
+#define L_PWM 8    // was LEFT_PWM_PIN
+#define R_DIR 10   // was RIGHT_EN_PIN
+#define R_PWM 9    // was RIGHT_PWM_PIN
+
+// ===== LED pins =====
+#define LED_G_PIN      14   // ON when C == 'G'
+#define LED_T_PIN      13   // ON when C == 'T'
+#define LED_STOP_PIN   21   // ON when BOTH motors are 0
+
+// ===== Buzzer pin =====
+#define BUZZER_PIN     16   // SFM-27-W buzzer (PWM)
+
+// Levels/polarity
+#define LEFT_FORWARD_LEVEL   HIGH
+#define RIGHT_FORWARD_LEVEL  HIGH
+#define LEFT_PWM_ACTIVE_HIGH   0   // 0 = active-LOW, 1 = active-HIGH
+#define RIGHT_PWM_ACTIVE_HIGH  0   // 0 = active-LOW, 1 = active-HIGH
+
+#define LEFT_PWM_PIN   L_PWM
+#define RIGHT_PWM_PIN  R_PWM
+#define LEFT_EN_PIN    L_DIR
+#define RIGHT_EN_PIN   R_DIR
+
+const bool LEFT_ACTIVE_LOW  = false;
+const bool RIGHT_ACTIVE_LOW = false;
+
+const float   GAMMA        = 2.2f;
+const uint8_t MIN_NONZERO  = 2;
+const int     MAX_DUTY     = 255;
+
+static char   lineBuf[256];
+static size_t lineLen = 0;
+
+static int  currentLeftDuty  = 0;
+static int  currentRightDuty = 0;
+
+// Track last "stopped" state so we only beep on transition moving -> stopped
+static bool gWasStopped = true;
+
+static TaskHandle_t modemTaskHandle = nullptr;
+
+// ---------- PWM helpers ----------
+static inline uint8_t gammaCorrect(uint8_t linear){
+  if(!linear) return 0;
+  float x = linear / 255.0f;
+  int out = (int)roundf(powf(x, GAMMA) * 255.0f);
+  if(out > 0 && out < MIN_NONZERO) out = MIN_NONZERO;
+  return (uint8_t)constrain(out, 0, 255);
+}
+
+static inline void pwmWritePin(int pin, int duty_linear_0_255, bool activeLow){
+  duty_linear_0_255 = constrain(duty_linear_0_255, 0, 255);
+  uint8_t duty = gammaCorrect((uint8_t)duty_linear_0_255);
+  if(activeLow) duty = 255 - duty;
+  analogWrite(pin, duty);
+}
+
+static inline void leftEnable (bool on){  digitalWrite(LEFT_EN_PIN,  on?HIGH:LOW); }
+static inline void rightEnable(bool on){  digitalWrite(RIGHT_EN_PIN, on?HIGH:LOW); }
+
+// helper to update "motors stopped" LED (LED_STOP_PIN)
+static inline void updateStopLed(){
+  bool bothZero = (currentLeftDuty == 0 && currentRightDuty == 0);
+
+  // Edge detect: moving -> stopped => beep once
+  if (bothZero && !gWasStopped) {
+    buzzerStart1s();
+  }
+  gWasStopped = bothZero;
+
+  digitalWrite(LED_STOP_PIN, bothZero ? HIGH : LOW);
+
+  // While system is NOT ready, don't touch the OLED.
+  if (!gSystemReady) {
+    return;
+  }
+
+  // === LCD behavior once system is ready ===
+  if (bothZero) {
+    // Both motors stopped -> show HELP regardless of category
+    displayHelp();
+  } else {
+    // Motors moving -> go back to last category (Trash / Treasure), if known
+    if (gLastCategory == 'G') {
+      displayTrash();
+    } else if (gLastCategory == 'T') {
+      displayTreasure();
+    }
+    // If no category yet, just leave whatever was on screen
+  }
+}
+
+void leftSetDuty (int d){
+  d = constrain(d, 0, MAX_DUTY);
+  pwmWritePin(LEFT_PWM_PIN, d, LEFT_ACTIVE_LOW);
+  leftEnable(d > 0);
+  currentLeftDuty = d;
+  updateStopLed();
+}
+
+void rightSetDuty(int d){
+  d = constrain(d, 0, MAX_DUTY);
+  pwmWritePin(RIGHT_PWM_PIN, d, RIGHT_ACTIVE_LOW);
+  rightEnable(d > 0);
+  currentRightDuty = d;
+  updateStopLed();
+}
+
+void stopBoth(){
+  leftSetDuty(0);
+  rightSetDuty(0);
+  leftEnable(false);
+  rightEnable(false);
+}
+
+// (left here in case you still want it later; no longer used)
+static inline int normalizeMagnitude(long v){
+  long mag = labs(v);
+  if (mag > 256) mag = 256;
+  int scaled = (int)roundf((mag / 256.0f) * 255.0f);
+  return constrain(scaled, 0, 255);
+}
+
+// ---------- JSON parsing ----------
+void handleJsonLine(const char* s);
+bool parseCategory(const char* s, char &outCat);
+// NEW: parse {"L":23:54}
+bool parseLMotorPair(const char* s, int &outLeft, int &outRight);
+
+// ---------- SIM helpers ----------
+String sendAT(const String &cmd, uint32_t timeout=10000, const char *waitFor=nullptr){
+  modem.println(cmd);
+  String resp;
+  uint32_t start = millis();
+  while (millis()-start < timeout) {
+    while (modem.available()) resp += (char)modem.read();
+    if (waitFor && resp.indexOf(waitFor)!=-1) break;
+    if (resp.indexOf("+HTTPACTION:")!=-1) break;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  return resp;
+}
+
+// ---------- Buzzer helper ----------
+void buzzerStart1s() {
+  // Simple 50% duty beep, freq set in setup (approx 4 kHz)
+  analogWrite(BUZZER_PIN, 128);       // 0-255 (50% duty)
+  gBuzzerOffMs = millis() + 1000;     // 1 second beep
+}
+
+// ===================== TASKS =====================
+
+// Core 0: Pi UART + motors
+void piMotorTask(void*){
+  Serial1.begin(PI_BAUD, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
+  while (Serial1.available()) Serial1.read();
+
+  pinMode(LEFT_EN_PIN, OUTPUT);
+  pinMode(RIGHT_EN_PIN, OUTPUT);
+
+  // LED setup
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_T_PIN, OUTPUT);
+  pinMode(LED_STOP_PIN, OUTPUT);
+  digitalWrite(LED_G_PIN, HIGH);
+  digitalWrite(LED_T_PIN, HIGH);
+  digitalWrite(LED_STOP_PIN, LOW);
+
+  // Buzzer setup
+  pinMode(BUZZER_PIN, OUTPUT);
+
+#if defined(ARDUINO_ARCH_ESP32)
+  analogWriteResolution(LEFT_PWM_PIN,   8);
+  analogWriteResolution(RIGHT_PWM_PIN,  8);
+  analogWriteResolution(BUZZER_PIN,     8);
+
+  analogWriteFrequency(LEFT_PWM_PIN,    5000);
+  analogWriteFrequency(RIGHT_PWM_PIN,   5000);
+  analogWriteFrequency(BUZZER_PIN,      4000);  // buzzer tone
+#endif
+
+  analogWrite(BUZZER_PIN, 0);   // start silent
+
+  stopBoth();  // calls updateStopLed(), but that won't touch OLED while !gSystemReady
+
+  for(;;){
+    while (Serial1.available()){
+      char c = (char)Serial1.read();
+      if (c=='\r') continue;
+      if (c=='\n'){
+        lineBuf[min(lineLen, sizeof(lineBuf)-1)] = '\0';
+        if(lineLen>0){
+          handleJsonLine(lineBuf);
+        }
+        lineLen = 0;
+      }else{
+        if (lineLen < sizeof(lineBuf)-1) lineBuf[lineLen++] = c;
+        else lineLen = 0;
+      }
+    }
+
+    // Handle buzzer timeout (non-blocking)
+    if (gBuzzerOffMs && (int32_t)(millis() - gBuzzerOffMs) >= 0) {
+      analogWrite(BUZZER_PIN, 0);   // turn buzzer off
+      gBuzzerOffMs = 0;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// Core 1: SIM7600
+float parseCoord(const String &coord, const String &dir) {
+  if (coord.length() < 4) return NAN;
+  if (coord == "" || coord == "0" || coord == "0.0") return NAN;
+
+  float v = coord.toFloat();
+  if (!isfinite(v)) return NAN;
+
+  int   deg = (int)floorf(v / 100.0f);
+  float min = v - (deg * 100.0f);
+  float dd  = deg + (min / 60.0f);
+
+  if (dir == "S" || dir == "W") dd = -dd;
+  return dd;
+}
+
+bool getGPS(float &lat, float &lon){
+  String resp = sendAT("AT+CGPSINFO", 5000);
+  int idx = resp.indexOf("+CGPSINFO:"); if(idx==-1) return false;
+  String data = resp.substring(idx+10); data.trim();
+  if (data.startsWith(",")) return false;
+  String t[8]; int last=0,c=0;
+  for(int i=0;i<data.length() && c<8;i++){
+    if(data[i]==','||data[i]=='\n'||data[i]=='\r'){ t[c++]=data.substring(last,i); last=i+1; }
+  }
+  if(c<4) return false;
+  lat = parseCoord(t[0], t[1]); lon = parseCoord(t[2], t[3]);
+  return (lat!=0 && lon!=0);
+}
+
+void modemTask(void*) {
+  modem.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  vTaskDelay(pdMS_TO_TICKS(1500));
+
+  sendAT("AT");
+  sendAT("ATE0");
+  sendAT("AT+CPIN?");
+  sendAT("AT+CSQ");
+  sendAT("AT+CGATT=1", 10000);
+  sendAT("AT+CGDCONT=1,\"IP\",\"" APN "\"");
+  sendAT("AT+CGPADDR=1");
+  sendAT("AT+CGPS=0", 1500);
+  sendAT("AT+CGPS=1", 5000);
+
+  sendAT("AT+HTTPTERM");
+  sendAT("AT+HTTPINIT");
+  sendAT("AT+HTTPPARA=\"CID\",1");
+  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+  sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
+  sendAT("AT+HTTPSSL=1");
+
+  // When HTTP + SSL are ready, you turn both LEDs off:
+  digitalWrite(LED_G_PIN, LOW);
+  digitalWrite(LED_T_PIN, LOW);
+
+  // === Mark system as ready & show READY on OLED ===
+  gSystemReady = true;
+  displayReady();
+
+  const uint32_t MIN_POST_GAP_MS = 3000;
+  uint32_t lastPostMs = 0;
+
+  for (;;) {
+    // Wait until piMotorTask notifies us (on category change)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    uint32_t now = millis();
+    if (now - lastPostMs < MIN_POST_GAP_MS) {
+      continue;
+    }
+
+    // Snapshot category at the moment we were triggered
+    char labelChar = gLastCategory;
+    if (labelChar != 'T' && labelChar != 'G') {
+      labelChar = '?';   // fallback if somehow unset
+    }
+
+    float lat = NAN, lon = NAN;
+    for (int i = 0; i < 8 && (isnan(lat) || isnan(lon)); ++i) {
+      if (getGPS(lat, lon)) break;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (isnan(lat) || isnan(lon)) {
+      lat=0; lon=0;
+    }
+
+    // ================================
+    // BUILD JSON BODY WITH LABEL "T"/"G"
+    // Ex: {"lat":28.5986,"lon":-81.1986,"label":"T"}
+    // ================================
+    String body = String("{\"lat\":") + String(lat, 6) +
+                  ",\"lon\":" + String(lon, 6) +
+                  ",\"label\":\"" + String(labelChar) + "\"}";
+
+    auto postOnce = [&]() {
+      int len = body.length();
+      String r = sendAT("AT+HTTPDATA=" + String(len) + ",10000", 5000, "DOWNLOAD");
+      if (r.indexOf("DOWNLOAD") == -1) return false;
+      modem.print(body);
+      vTaskDelay(pdMS_TO_TICKS(300));
+      r = sendAT("AT+HTTPACTION=1", 15000, "+HTTPACTION:");
+      if (r.indexOf("+HTTPACTION:") == -1) return false;
+      sendAT("AT+HTTPREAD", 5000);
+      return true;
+    };
+
+    if (!postOnce()) {
+      sendAT("AT+HTTPTERM");
+      sendAT("AT+HTTPINIT");
+      sendAT("AT+HTTPPARA=\"CID\",1");
+      sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+      sendAT("AT+HTTPPARA=\"URL\",\"" URL "\"");
+      sendAT("AT+HTTPSSL=1");
+      postOnce();
+    }
+
+    lastPostMs = millis();
+  }
+}
+
+// ---------- JSON handlers ----------
+void handleJsonLine(const char* s){
+  // trim leading/trailing spaces (for safety)
+  while(*s==' '||*s=='\t') s++;
+  size_t n = strlen(s);
+  while(n && (s[n-1]==' '||s[n-1]=='\t')) n--;
+
+  if (n==0 || s[0] != '{' || strchr(s, '}') == nullptr) {
+    return;
+  }
+
+  // 1) Category handling first ({"C":"T"} / {"C":"G"})
+  char cat;
+  if (parseCategory(s, cat)) {
+    if (cat == 'T') {
+      digitalWrite(LED_T_PIN, HIGH);
+      digitalWrite(LED_G_PIN, LOW);
+      gLastCategory = 'T';
+      // Only change display if system is ready; otherwise keep WAITING
+      if (gSystemReady) displayTreasure();
+      if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
+    } else if (cat == 'G') {
+      digitalWrite(LED_G_PIN, HIGH);
+      digitalWrite(LED_T_PIN, LOW);
+      gLastCategory = 'G';
+      if (gSystemReady) displayTrash();
+      if (modemTaskHandle) xTaskNotifyGive(modemTaskHandle);
+    }
+  }
+
+  // 2) L-pair handling: {"L":23:54}
+  int leftVal, rightVal;
+  if (parseLMotorPair(s, leftVal, rightVal)) {
+    leftVal  = constrain(leftVal,  0, 255);
+    rightVal = constrain(rightVal, 0, 255);
+    leftSetDuty(leftVal);
+    rightSetDuty(rightVal);
+  }
+}
+
+bool parseLMotorPair(const char* s, int &outLeft, int &outRight){
+  // Look for "L"
+  const char* k = strstr(s, "\"L\"");
+  if (!k) return false;
+
+  // First colon after "L"
+  const char* c = strchr(k, ':');
+  if (!c) return false;
+
+  const char* p = c + 1;
+  // skip whitespace
+  while (*p == ' ' || *p == '\t') p++;
+
+  // ---------- parse LEFT ----------
+  bool neg = false;   // we'll allow signs, but you probably will just send 0..255
+  if (*p == '-') { neg = true; p++; }
+  else if (*p == '+') { p++; }
+
+  if (*p < '0' || *p > '9') return false;
+
+  long vLeft = 0;
+  while (*p >= '0' && *p <= '9') {
+    vLeft = vLeft * 10 + (*p - '0');
+    p++;
+  }
+  if (neg) vLeft = -vLeft;
+
+  // skip whitespace
+  while (*p == ' ' || *p == '\t') p++;
+
+  // Expect ':' between left and right
+  if (*p != ':') {
+    // If there's no colon, we could treat single value as both,
+    // but your format is {"L":23:54}, so just fail here.
+    return false;
+  }
+  p++; // move past ':'
+
+  // skip whitespace
+  while (*p == ' ' || *p == '\t') p++;
+
+  // ---------- parse RIGHT ----------
+  neg = false;
+  if (*p == '-') { neg = true; p++; }
+  else if (*p == '+') { p++; }
+
+  if (*p < '0' || *p > '9') return false;
+
+  long vRight = 0;
+  while (*p >= '0' && *p <= '9') {
+    vRight = vRight * 10 + (*p - '0');
+    p++;
+  }
+  if (neg) vRight = -vRight;
+
+  outLeft  = (int)vLeft;
+  outRight = (int)vRight;
+  return true;
+}
+
+bool parseCategory(const char* s, char &outCat){
+  const char* k=strstr(s,"\"C\""); if(!k) return false;
+  const char* c=strchr(k,':');     if(!c) return false;
+  const char* p=c+1;
+  while(*p==' '||*p=='\t') p++;
+  if(*p!='\"') return false;
+  p++;
+  if(!*p) return false;
+  outCat=*p;
+  return true;
+}
+
+// ===================== OLED HELPER FUNCTIONS =====================
+
+void displayWaiting() {
+  if (gDisplayMode == DISP_WAIT) return;
+  gDisplayMode = DISP_WAIT;
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("R.O.A.M."));
+  display.setCursor(0, 30);
+  display.println(F("WAITING"));
+  display.display();
+}
+
+void displayReady() {
+  if (gDisplayMode == DISP_READY) return;
+  gDisplayMode = DISP_READY;
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("R.O.A.M."));
+  display.setCursor(0, 30);
+  display.println(F("READY"));
+  display.display();
+}
+
+void displayTrash() {
+  if (gDisplayMode == DISP_TRASH) return;
+  gDisplayMode = DISP_TRASH;
+
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20);
+  display.println(F("Trash"));
+  display.display();
+}
+
+void displayTreasure() {
+  if (gDisplayMode == DISP_TREASURE) return;
+  gDisplayMode = DISP_TREASURE;
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20);
+  display.println(F("Treasure"));
+  display.display();
+}
+
+void displayHelp() {
+  if (gDisplayMode == DISP_HELP) return;
+  gDisplayMode = DISP_HELP;
+
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(20, 20);
+  display.println(F("HELP"));
+  display.display();
+}
+
+void refreshDisplayForState() {
+  bool bothZero = (currentLeftDuty == 0 && currentRightDuty == 0);
+  if (bothZero) {
+    displayHelp();
+  } else {
+    if (gLastCategory == 'G')      displayTrash();
+    else if (gLastCategory == 'T') displayTreasure();
+  }
+}
+
+// ===================== Arduino entry =====================
+void setup(){
+  // ---- OLED init ----
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    // If OLED fails, we silently continue now (no Serial debug)
+  } else {
+    // Show WAITING from startup
+    displayWaiting();
+  }
+
+  xTaskCreatePinnedToCore(piMotorTask, "piMotorTask", 4096, NULL, 2, NULL, 0);               // Core 0
+  xTaskCreatePinnedToCore(modemTask,   "modemTask",   8192, NULL, 2, &modemTaskHandle, 1);   // Core 1
+}
+
+void loop(){}
